@@ -5,7 +5,7 @@
 #  - 支持 UDP 端口跳跃 (Port Hopping / mport，含 INPUT 链与 NAT 联动放行)
 #  - 支持 Salamander 协议特征混淆 (Obfs)
 #  - 强制 ignoreClientBandwidth + BBR 防 QoS 调优
-#  - 支持服务端内核更新、脚本自更新、一键干净卸载
+#  - 支持自动检测已安装实例，交互选择重装或卸载
 # =========================================================
 
 set -e
@@ -17,19 +17,13 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# ----------------- 卸载逻辑 -----------------
-uninstall_hysteria() {
-  echo "⚠️ 准备卸载 Hysteria 2 及所有关联配置..."
-  read -p "确认彻底卸载吗？此操作不可逆！[y/N]: " CONFIRM_UNINSTALL
-  if [[ ! "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
-    echo "已取消卸载。"
-    exit 0
-  fi
-
+# ----------------- 卸载执行函数 -----------------
+execute_uninstall() {
   echo "1. 停止并清理 Systemd 守护进程..."
   systemctl stop hysteria-server 2>/dev/null || true
   systemctl disable hysteria-server 2>/dev/null || true
   rm -f /etc/systemd/system/hysteria-server.service
+  rm -rf /etc/systemd/system/hysteria-server.service.d
   systemctl daemon-reload
 
   echo "2. 清理 iptables 防火墙及端口跳跃规则..."
@@ -62,7 +56,16 @@ uninstall_hysteria() {
   rm -f /usr/local/bin/hysteria
   rm -f /usr/local/bin/hy
   rm -rf /etc/hysteria
+}
 
+uninstall_hysteria() {
+  echo "⚠️ 准备卸载 Hysteria 2 及所有关联配置..."
+  read -p "确认彻底卸载吗？此操作不可逆！[y/N]: " CONFIRM_UNINSTALL
+  if [[ ! "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
+    echo "已取消卸载。"
+    exit 0
+  fi
+  execute_uninstall
   echo "✅ Hysteria 2 及其所有组件已彻底卸载干净！"
   exit 0
 }
@@ -108,13 +111,43 @@ upgrade_script() {
   exit 0
 }
 
-# 命令行入参判断
+# 命令行入参直接响应
 if [ "$1" == "uninstall" ]; then
   uninstall_hysteria
 elif [ "$1" == "update" ]; then
   update_core
 elif [ "$1" == "upgrade-script" ]; then
   upgrade_script
+fi
+
+# ----------------- 检测已有安装实例 -----------------
+if [ -f /usr/local/bin/hysteria ] || [ -f /etc/hysteria/config.yaml ]; then
+  echo "========================================================="
+  echo "⚠️ 检测到当前机器已安装 Hysteria 2！"
+  echo "---------------------------------------------------------"
+  echo "请选择操作："
+  echo "  1) 重新安装 / 覆盖现有配置 (推荐: 重新配置端口、域名或证书)"
+  echo "  2) 彻底卸载 Hysteria 2"
+  echo "  3) 退出脚本"
+  echo "========================================================="
+  read -p "请输入选项 [1-3，默认 1]: " EXIST_CHOICE
+  EXIST_CHOICE=${EXIST_CHOICE:-1}
+
+  case "$EXIST_CHOICE" in
+    1)
+      echo "正在清理旧实例规则与服务，准备开始重装..."
+      execute_uninstall
+      echo "旧实例清理完成，即将启动全新配置向导。"
+      echo ""
+      ;;
+    2)
+      uninstall_hysteria
+      ;;
+    *)
+      echo "已取消操作，退出脚本。"
+      exit 0
+      ;;
+  esac
 fi
 
 echo "========================================================="
