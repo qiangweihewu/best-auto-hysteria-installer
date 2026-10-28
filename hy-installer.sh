@@ -5,13 +5,116 @@
 #  - 支持 UDP 端口跳跃 (Port Hopping / mport，含 INPUT 链与 NAT 联动放行)
 #  - 支持 Salamander 协议特征混淆 (Obfs)
 #  - 强制 ignoreClientBandwidth + BBR 防 QoS 调优
+#  - 支持服务端内核更新、脚本自更新、一键干净卸载
 # =========================================================
 
 set -e
 
+REPO_RAW_URL="https://raw.githubusercontent.com/qiangweihewu/best-auto-hysteria-installer/main/install.sh"
+
 if [ "$EUID" -ne 0 ]; then
   echo "❌ 错误: 请使用 root 权限运行此脚本 (例如: sudo -i 后再运行)"
   exit 1
+fi
+
+# ----------------- 卸载逻辑 -----------------
+uninstall_hysteria() {
+  echo "⚠️ 准备卸载 Hysteria 2 及所有关联配置..."
+  read -p "确认彻底卸载吗？此操作不可逆！[y/N]: " CONFIRM_UNINSTALL
+  if [[ ! "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
+    echo "已取消卸载。"
+    exit 0
+  fi
+
+  echo "1. 停止并清理 Systemd 守护进程..."
+  systemctl stop hysteria-server 2>/dev/null || true
+  systemctl disable hysteria-server 2>/dev/null || true
+  rm -f /etc/systemd/system/hysteria-server.service
+  systemctl daemon-reload
+
+  echo "2. 清理 iptables 防火墙及端口跳跃规则..."
+  if [ -f /etc/hysteria/hopping.env ]; then
+    source /etc/hysteria/hopping.env 2>/dev/null || true
+    if [ -n "$PORT_HOPPING_RANGE" ]; then
+      iptables -D INPUT -p udp --dport "$PORT_HOPPING_RANGE" -j ACCEPT 2>/dev/null || true
+      iptables -t nat -D PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
+      iptables -t nat -F HYSTERIA_HOPPING 2>/dev/null || true
+      iptables -t nat -X HYSTERIA_HOPPING 2>/dev/null || true
+
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D INPUT -p udp --dport "$PORT_HOPPING_RANGE" -j ACCEPT 2>/dev/null || true
+        ip6tables -t nat -D PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
+        ip6tables -t nat -F HYSTERIA_HOPPING 2>/dev/null || true
+        ip6tables -t nat -X HYSTERIA_HOPPING 2>/dev/null || true
+      fi
+    fi
+  fi
+  iptables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -D INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+  fi
+
+  echo "3. 清除系统内核网络调优参数..."
+  rm -f /etc/sysctl.d/99-hysteria-tuned.conf
+  sysctl --system >/dev/null 2>&1 || true
+
+  echo "4. 删除二进制文件、配置文件与管理命令..."
+  rm -f /usr/local/bin/hysteria
+  rm -f /usr/local/bin/hy
+  rm -rf /etc/hysteria
+
+  echo "✅ Hysteria 2 及其所有组件已彻底卸载干净！"
+  exit 0
+}
+
+# ----------------- 更新服务端内核逻辑 -----------------
+update_core() {
+  echo "🔍 检查并更新 Hysteria 2 服务端内核..."
+  ARCH=$(uname -m)
+  if [ "$ARCH" != "x86_64" ]; then
+    echo "❌ 仅支持 x86_64 架构"
+    exit 1
+  fi
+
+  if grep -q avx /proc/cpuinfo; then
+    BIN_NAME="hysteria-linux-amd64-avx"
+  else
+    BIN_NAME="hysteria-linux-amd64"
+  fi
+
+  echo "正在拉取最新版本: ${BIN_NAME} ..."
+  curl -fL -o /usr/local/bin/hysteria.tmp "https://github.com/apernet/hysteria/releases/latest/download/${BIN_NAME}"
+  chmod +x /usr/local/bin/hysteria.tmp
+  mv -f /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
+
+  echo "正在重启 Hysteria 服务以加载新版本..."
+  systemctl restart hysteria-server
+  sleep 1
+  if systemctl is-active --quiet hysteria-server; then
+    CURRENT_VER=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || echo "最新版")
+    echo "🎉 服务端内核更新成功！当前运行版本: $CURRENT_VER"
+  else
+    echo "❌ 服务启动异常，请使用 hy logs 排查！"
+  fi
+  exit 0
+}
+
+# ----------------- 更新脚本本身逻辑 -----------------
+upgrade_script() {
+  echo "🔍 正在从 GitHub 仓库拉取最新脚本..."
+  curl -fsSL "$REPO_RAW_URL" -o /usr/local/bin/install-hysteria.sh
+  chmod +x /usr/local/bin/install-hysteria.sh
+  echo "🎉 脚本自身已更新到最新版本！脚本存储路径: /usr/local/bin/install-hysteria.sh"
+  exit 0
+}
+
+# 命令行入参判断
+if [ "$1" == "uninstall" ]; then
+  uninstall_hysteria
+elif [ "$1" == "update" ]; then
+  update_core
+elif [ "$1" == "upgrade-script" ]; then
+  upgrade_script
 fi
 
 echo "========================================================="
@@ -31,7 +134,6 @@ TOTAL_MEM_MB=$(free -m | awk '/Mem:/ {print $2}')
 FREE_MEM_MB=$(free -m | awk '/Mem:/ {print $4}')
 echo "硬件规格: CPU 核心数 = $CPU_CORES, 总内存 = ${TOTAL_MEM_MB}MB, 空闲内存 = ${FREE_MEM_MB}MB"
 
-# 自动获取本机公网 IPv4
 SERVER_IP=$(curl -s4m 5 https://api.ipify.org || curl -s4m 5 https://icanhazip.com || echo "127.0.0.1")
 
 # ----------------- 2. 证书与域名配置 -----------------
@@ -96,7 +198,6 @@ CERTBOT_EOF
     read -p "请输入接收证书通知的邮箱: " ACME_EMAIL
     [ -z "$ACME_EMAIL" ] && { echo "❌ 邮箱不能为空！"; exit 1; }
 
-    # 官方标准: acme 必须为顶层配置，绝对不能嵌套在 tls 下
     TLS_CONFIG_BLOCK=$(cat << ACME_EOF
 acme:
   domains:
@@ -252,6 +353,9 @@ mv -f /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
 
 mkdir -p /etc/hysteria
 
+# 保存安装脚本副本供升级使用
+cp -f "$0" /usr/local/bin/install-hysteria.sh 2>/dev/null || true
+
 # ----------------- 5. 写入服务端配置 -----------------
 echo "=== [3/5] 写入服务端配置 ==="
 cat << CONFIGEOF > /etc/hysteria/config.yaml
@@ -314,22 +418,17 @@ if [ -n "$NIC" ]; then
   ethtool -K "$NIC" tx-udp-segmentation on 2>/dev/null || true
 fi
 
-# 核心：生成带 INPUT 链放行与 NAT 转发的健全防火墙规则脚本
 cat << 'RULEROOT' > /etc/hysteria/apply-rules.sh
 #!/bin/bash
 setup_rules() {
   local range="$1"
 
-  # 1. 显式放行 443 本身进站 (IPv4)
   iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT
 
-  # 如果未开启端口跳跃，只放行 443 即可退出
   [ -z "$range" ] && return 0
 
-  # 2. 显式放行跳跃端口范围进站
   iptables -C INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$range" -j ACCEPT
 
-  # 3. 配置 NAT PREROUTING 重定向链
   iptables -t nat -D PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
   iptables -t nat -F HYSTERIA_HOPPING 2>/dev/null || true
   iptables -t nat -X HYSTERIA_HOPPING 2>/dev/null || true
@@ -338,7 +437,6 @@ setup_rules() {
   iptables -t nat -A HYSTERIA_HOPPING -p udp --dport "$range" -j REDIRECT --to-ports 443
   iptables -t nat -I PREROUTING -j HYSTERIA_HOPPING
 
-  # 4. 同步处理 IPv6 环境 (若内核支持)
   if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
     ip6tables -C INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || true
@@ -357,7 +455,6 @@ echo 'setup_rules "$PORT_HOPPING_RANGE"' >> /etc/hysteria/apply-rules.sh
 chmod +x /etc/hysteria/apply-rules.sh
 /etc/hysteria/apply-rules.sh
 
-# 缓存连接端信息供客户端读取
 cat << ENVEOF > /etc/hysteria/client_info.env
 CONNECT_HOST="$CONNECT_HOST"
 TLS_SNI="$TLS_SNI"
@@ -391,7 +488,6 @@ systemctl daemon-reload
 systemctl enable hysteria-server
 systemctl restart hysteria-server
 
-# 严格存活熔断检测
 sleep 2
 if ! systemctl is-active --quiet hysteria-server; then
   echo "❌ 启动失败！以下为最新 15 行错误日志："
@@ -399,9 +495,11 @@ if ! systemctl is-active --quiet hysteria-server; then
   exit 1
 fi
 
-# ----------------- 8. 挂载管理命令 hy -----------------
+# ----------------- 8. 挂载全局管理命令 hy -----------------
 cat << 'HYEOF' > /usr/local/bin/hy
 #!/usr/bin/env bash
+REPO_URL="https://raw.githubusercontent.com/qiangweihewu/best-auto-hysteria-installer/main/install.sh"
+
 get_pass() {
     grep -A 2 "^auth:" /etc/hysteria/config.yaml 2>/dev/null | grep "password:" | head -n 1 | awk -F'"' '{print $2}'
 }
@@ -446,7 +544,6 @@ case "$1" in
         OBFS_PASS=$(get_obfs_pass)
         HOP_RANGE=$(get_hop_range)
 
-        # 端口跳跃解析
         MPORT_PARAM=""
         MPORT_YAML="443"
         if [ -n "$HOP_RANGE" ]; then
@@ -455,7 +552,6 @@ case "$1" in
           MPORT_YAML="443,$DASH_RANGE"
         fi
 
-        # 混淆解析
         OBFS_URI_PARAM=""
         OBFS_YAML_BLOCK=""
         if [ -n "$OBFS_PASS" ]; then
@@ -469,7 +565,6 @@ YAML_OBFS
 )
         fi
 
-        # 自签 Pinning / Insecure 解析
         PIN_PARAM=""
         PIN_YAML_LINE=""
         if [ -n "$PIN_SHA256" ]; then
@@ -502,8 +597,29 @@ socks5:
   listen: 127.0.0.1:10808
 CLI_YAML
         ;;
+    update)
+        echo "正在更新 Hysteria 2 服务端核心..."
+        bash <(curl -fsSL "$REPO_URL") update
+        ;;
+    upgrade-script)
+        echo "正在更新管理脚本自身..."
+        bash <(curl -fsSL "$REPO_URL") upgrade-script
+        ;;
+    uninstall)
+        bash <(curl -fsSL "$REPO_URL") uninstall
+        ;;
     *)
-        echo "用法: hy {start|stop|restart|status|logs|server|client}"
+        echo "用法: hy {start|stop|restart|status|logs|server|client|update|upgrade-script|uninstall}"
+        echo "  start          - 启动服务"
+        echo "  stop           - 停止服务"
+        echo "  restart        - 重启服务"
+        echo "  status         - 查看运行状态"
+        echo "  logs           - 实时查看日志"
+        echo "  server         - 查看服务端配置"
+        echo "  client         - 查看客户端配置与节点链接"
+        echo "  update         - 更新 Hysteria 2 服务端内核到最新版"
+        echo "  upgrade-script - 从 GitHub 仓库更新脚本本身"
+        echo "  uninstall      - 彻底卸载 Hysteria 2 及其所有规则配置"
         ;;
 esac
 HYEOF
@@ -513,6 +629,6 @@ chmod +x /usr/local/bin/hy
 echo ""
 echo "========================================================="
 echo "🎉 Hysteria 2 安装成功且已正常运行！"
-echo "管理命令: hy {start|stop|restart|status|logs|server|client}"
+echo "管理命令: hy {start|stop|restart|status|logs|server|client|update|upgrade-script|uninstall}"
 echo "========================================================="
 /usr/local/bin/hy client
