@@ -55,6 +55,7 @@ execute_uninstall() {
   echo "4. 删除二进制文件、配置文件与管理命令..."
   rm -f /usr/local/bin/hysteria
   rm -f /usr/local/bin/hy
+  rm -f /usr/local/bin/install-hysteria.sh
   rm -rf /etc/hysteria
 }
 
@@ -107,7 +108,7 @@ upgrade_script() {
   echo "🔍 正在从 GitHub 仓库拉取最新脚本..."
   curl -fsSL "$REPO_RAW_URL" -o /usr/local/bin/install-hysteria.sh
   chmod +x /usr/local/bin/install-hysteria.sh
-  echo "🎉 脚本自身已更新到最新版本！脚本存储路径: /usr/local/bin/install-hysteria.sh"
+  echo "🎉 脚本自身已更新到最新版本！存储路径: /usr/local/bin/install-hysteria.sh"
   exit 0
 }
 
@@ -386,8 +387,9 @@ mv -f /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
 
 mkdir -p /etc/hysteria
 
-# 保存安装脚本副本供升级使用
-cp -f "$0" /usr/local/bin/install-hysteria.sh 2>/dev/null || true
+# 修正：通过 curl 下载独立脚本副本保存到本地，严禁读取不可寻址的管道描述符 $0
+curl -fsSL "$REPO_RAW_URL" -o /usr/local/bin/install-hysteria.sh 2>/dev/null || true
+chmod +x /usr/local/bin/install-hysteria.sh 2>/dev/null || true
 
 # ----------------- 5. 写入服务端配置 -----------------
 echo "=== [3/5] 写入服务端配置 ==="
