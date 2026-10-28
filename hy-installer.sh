@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
-#  Hysteria 2 一键极速安装与管理脚本 (生产优化版)
-#  - 支持 Certbot 自动停启 Web 服务释放 80 端口
-#  - 支持 Hysteria 2 内置 ACME 独立申请与热更新
+#  Hysteria 2 一键极速安装与管理脚本 (生产增强版)
+#  - 支持 5 种 TLS 模式: Certbot、内置ACME、自签证书(Pinning)、IP证书、自定义证书
 #  - 支持 UDP 端口跳跃 (Port Hopping / mport)
 #  - 支持 Salamander 协议特征混淆 (Obfs)
 #  - 强制 ignoreClientBandwidth + BBR 防 QoS 调优
@@ -10,7 +9,6 @@
 
 set -e
 
-# 必须 root 权限
 if [ "$EUID" -ne 0 ]; then
   echo "❌ 错误: 请使用 root 权限运行此脚本 (例如: sudo -i 后再运行)"
   exit 1
@@ -20,7 +18,7 @@ echo "========================================================="
 echo "           Hysteria 2 自动化部署向导"
 echo "========================================================="
 
-# ----------------- 1. 环境检测 -----------------
+# ----------------- 1. 环境与架构检测 -----------------
 echo "=== [1/5] 系统硬件与环境检测 ==="
 ARCH=$(uname -m)
 if [ "$ARCH" != "x86_64" ]; then
@@ -33,92 +31,159 @@ TOTAL_MEM_MB=$(free -m | awk '/Mem:/ {print $2}')
 FREE_MEM_MB=$(free -m | awk '/Mem:/ {print $4}')
 echo "硬件规格: CPU 核心数 = $CPU_CORES, 总内存 = ${TOTAL_MEM_MB}MB, 空闲内存 = ${FREE_MEM_MB}MB"
 
-# ----------------- 2. 用户交互配置 -----------------
-echo ""
-read -p "请输入绑定的 Hysteria 域名 (例如 hy.example.com): " DOMAIN
-if [ -z "$DOMAIN" ]; then
-  echo "❌ 域名不能为空！"
-  exit 1
-fi
+# 自动获取本机公网 IPv4
+SERVER_IP=$(curl -s4m 5 https://api.ipify.org || curl -s4m 5 https://icanhazip.com || echo "127.0.0.1")
 
+# ----------------- 2. 证书与域名配置 -----------------
 echo ""
 echo "--------------------------------------------------------"
 echo "【选项 1: TLS 证书申请与管理模式】"
-echo "  1) Certbot 自动管理 (推荐: 续期时自动停启 Nginx/Apache 释放 80 端口，全自动化)"
+echo "  1) Certbot 自动管理 (域名验证，续期自动停启 Nginx/Apache 释放 80 端口)"
 echo "  2) Hysteria 2 内置 ACME (适合无 Web 服务的机器，80 端口须长期空闲)"
-echo "  3) 手动指定现有证书路径 (已有本地证书文件)"
+echo "  3) 自动生成自签名证书 (完全无需域名，自动生成安全 pinSHA256 指纹)"
+echo "  4) 公网 IP 地址证书 (已有 ZeroSSL 等机构为公网 IP 签发的证书)"
+echo "  5) 手动指定现有证书文件 (已有域名证书路径)"
 echo "--------------------------------------------------------"
-read -p "请输入证书选项 [1-3，默认 1]: " CERT_MODE
+read -p "请输入证书选项 [1-5，默认 1]: " CERT_MODE
 CERT_MODE=${CERT_MODE:-1}
 
 TLS_CONFIG_BLOCK=""
-if [ "$CERT_MODE" == "1" ]; then
-  read -p "请输入接收证书通知的邮箱 (例如 admin@example.com): " ACME_EMAIL
-  if [ -z "$ACME_EMAIL" ]; then
-    echo "❌ 邮箱不能为空！"
-    exit 1
-  fi
+CONNECT_HOST=""
+PIN_SHA256=""
+TLS_SNI=""
+INSECURE_FLAG="false"
 
-  echo "正在安装 Certbot 依赖组件..."
-  apt-get update -y && apt-get install -y certbot 2>/dev/null || yum install -y epel-release certbot 2>/dev/null || true
+case "$CERT_MODE" in
+  1)
+    read -p "请输入解析到本机的域名 (例如 hy.example.com): " DOMAIN
+    [ -z "$DOMAIN" ] && { echo "❌ 域名不能为空！"; exit 1; }
+    CONNECT_HOST="$DOMAIN"
+    TLS_SNI="$DOMAIN"
 
-  CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-  KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    read -p "请输入接收证书通知的邮箱: " ACME_EMAIL
+    [ -z "$ACME_EMAIL" ] && { echo "❌ 邮箱不能为空！"; exit 1; }
 
-  echo "正在申请 Let's Encrypt 证书并绑定自动停启服务钩子..."
-  certbot certonly --standalone -d "$DOMAIN" -m "$ACME_EMAIL" --agree-tos -n \
-    --pre-hook "systemctl stop nginx apache2 httpd caddy 2>/dev/null || true" \
-    --post-hook "systemctl start nginx apache2 httpd caddy 2>/dev/null || true; systemctl try-restart hysteria-server 2>/dev/null || true"
+    echo "正在安装 Certbot 依赖组件..."
+    apt-get update -y && apt-get install -y certbot 2>/dev/null || yum install -y epel-release certbot 2>/dev/null || true
 
-  if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
-    echo "❌ Certbot 申请证书失败，未生成证书文件。请确认 80 端口畅通且域名 DNS 已解析到本机！"
-    exit 1
-  fi
+    CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 
-  TLS_CONFIG_BLOCK=$(cat << CERTBOT_EOF
+    echo "正在申请 Let's Encrypt 证书并绑定自动停启服务钩子..."
+    certbot certonly --standalone -d "$DOMAIN" -m "$ACME_EMAIL" --agree-tos -n \
+      --pre-hook "systemctl stop nginx apache2 httpd caddy 2>/dev/null || true" \
+      --post-hook "systemctl start nginx apache2 httpd caddy 2>/dev/null || true; systemctl try-restart hysteria-server 2>/dev/null || true"
+
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+      echo "❌ Certbot 申请证书失败，请确认 80 端口畅通且 DNS 已正确解析！"
+      exit 1
+    fi
+
+    TLS_CONFIG_BLOCK=$(cat << CERTBOT_EOF
 tls:
   cert: $CERT_FILE
   key: $KEY_FILE
   sniGuard: dns-san
 CERTBOT_EOF
 )
-elif [ "$CERT_MODE" == "2" ]; then
-  read -p "请输入接收证书通知的邮箱 (例如 admin@example.com): " ACME_EMAIL
-  if [ -z "$ACME_EMAIL" ]; then
-    echo "❌ 邮箱不能为空！"
-    exit 1
-  fi
+    ;;
 
-  # Hysteria 2 官方规范: acme 必须为顶层配置，不能写在 tls 内部
-  TLS_CONFIG_BLOCK=$(cat << ACME_EOF
+  2)
+    read -p "请输入解析到本机的域名 (例如 hy.example.com): " DOMAIN
+    [ -z "$DOMAIN" ] && { echo "❌ 域名不能为空！"; exit 1; }
+    CONNECT_HOST="$DOMAIN"
+    TLS_SNI="$DOMAIN"
+
+    read -p "请输入接收证书通知的邮箱: " ACME_EMAIL
+    [ -z "$ACME_EMAIL" ] && { echo "❌ 邮箱不能为空！"; exit 1; }
+
+    TLS_CONFIG_BLOCK=$(cat << ACME_EOF
 acme:
   domains:
     - $DOMAIN
   email: $ACME_EMAIL
 ACME_EOF
 )
-else
-  DEFAULT_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-  DEFAULT_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-  read -p "请输入证书完整路径 [默认: $DEFAULT_CERT]: " CERT_FILE
-  CERT_FILE=${CERT_FILE:-$DEFAULT_CERT}
-  read -p "请输入私钥完整路径 [默认: $DEFAULT_KEY]: " KEY_FILE
-  KEY_FILE=${KEY_FILE:-$DEFAULT_KEY}
+    ;;
 
-  if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
-    echo "❌ 错误: 未找到指定的证书或私钥文件！"
-    exit 1
-  fi
+  3)
+    echo "💡 模式 3: 无需域名，将使用 ECC 椭圆曲线签发 10 年有效期的自签证书。"
+    read -p "请输入伪装 SNI 域名 [默认 bing.com]: " CUSTOM_SNI
+    CUSTOM_SNI=${CUSTOM_SNI:-"bing.com"}
+    TLS_SNI="$CUSTOM_SNI"
+    CONNECT_HOST="$SERVER_IP"
 
-  TLS_CONFIG_BLOCK=$(cat << MANUAL_EOF
+    mkdir -p /etc/hysteria
+    CERT_FILE="/etc/hysteria/selfsign.crt"
+    KEY_FILE="/etc/hysteria/selfsign.key"
+
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+      -keyout "$KEY_FILE" \
+      -out "$CERT_FILE" \
+      -subj "/CN=$TLS_SNI" \
+      -days 3650 >/dev/null 2>&1
+
+    # 计算证书公钥指纹 (Pinning)
+    PIN_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_FILE" | tr -d ':' | awk -F'=' '{print $2}')
+    echo "✅ 自签名证书已生成，公钥指纹: $PIN_SHA256"
+
+    TLS_CONFIG_BLOCK=$(cat << SELFSIGN_EOF
+tls:
+  cert: $CERT_FILE
+  key: $KEY_FILE
+  sniGuard: disable
+SELFSIGN_EOF
+)
+    ;;
+
+  4)
+    echo "💡 模式 4: 公网 IP 地址证书（客户端使用公网 IP 作为 SNI 直连，无需开启 insecure）"
+    CONNECT_HOST="$SERVER_IP"
+    TLS_SNI="$SERVER_IP"
+
+    read -p "请输入 IP 证书完整路径 (crt/cer/pem): " CERT_FILE
+    read -p "请输入 IP 私钥完整路径 (key): " KEY_FILE
+
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+      echo "❌ 未找到指定的 IP 证书或私钥文件！"
+      exit 1
+    fi
+
+    TLS_CONFIG_BLOCK=$(cat << IPCERT_EOF
+tls:
+  cert: $CERT_FILE
+  key: $KEY_FILE
+  sniGuard: disable
+IPCERT_EOF
+)
+    ;;
+
+  5)
+    read -p "请输入证书绑定的域名或 SNI: " DOMAIN
+    CONNECT_HOST="$DOMAIN"
+    TLS_SNI="$DOMAIN"
+
+    read -p "请输入证书完整路径 [默认 /etc/letsencrypt/live/$DOMAIN/fullchain.pem]: " CERT_FILE
+    CERT_FILE=${CERT_FILE:-"/etc/letsencrypt/live/$DOMAIN/fullchain.pem"}
+    read -p "请输入私钥完整路径 [默认 /etc/letsencrypt/live/$DOMAIN/privkey.pem]: " KEY_FILE
+    KEY_FILE=${KEY_FILE:-"/etc/letsencrypt/live/$DOMAIN/privkey.pem"}
+
+    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+      echo "❌ 未找到指定的证书或私钥文件！"
+      exit 1
+    fi
+
+    TLS_CONFIG_BLOCK=$(cat << MANUAL_EOF
 tls:
   cert: $CERT_FILE
   key: $KEY_FILE
   sniGuard: dns-san
 MANUAL_EOF
 )
-fi
+    ;;
+esac
 
+# ----------------- 3. 密码、端口跳跃与混淆 -----------------
 echo ""
 read -p "请输入连接密码 (留空则随机生成): " PASSWORD
 if [ -z "$PASSWORD" ]; then
@@ -126,7 +191,6 @@ if [ -z "$PASSWORD" ]; then
   echo "已生成随机密码: $PASSWORD"
 fi
 
-# 选项 2: 端口跳跃
 echo ""
 echo "--------------------------------------------------------"
 echo "【选项 2: UDP 端口跳跃 (Port Hopping)】"
@@ -143,11 +207,10 @@ if [[ "$ENABLE_HOPPING" =~ ^[Yy]$ ]]; then
   echo "✅ 端口跳跃已启用: $PORT_RANGE -> 443"
 fi
 
-# 选项 3: 混淆
 echo ""
 echo "--------------------------------------------------------"
 echo "【选项 3: Salamander 协议混淆 (Obfs)】"
-echo "说明: 将 QUIC 数据包头部转为无序随机密文，抵御特定运营商的 QUIC 阻断。"
+echo "说明: 将 QUIC 数据包头部转为无序随机密文，抵御特定运营商的特征阻断。"
 echo "--------------------------------------------------------"
 read -p "是否开启 Salamander 混淆？[y/N，默认 N]: " ENABLE_OBFS
 ENABLE_OBFS=${ENABLE_OBFS:-n}
@@ -171,7 +234,7 @@ OBFS_EOF
   echo "✅ Salamander 混淆已启用！"
 fi
 
-# ----------------- 3. 下载与安装 -----------------
+# ----------------- 4. 下载安装 Hysteria 2 -----------------
 echo ""
 echo "=== [2/5] 下载安装 Hysteria 2 内核 ==="
 apt-get update -y && apt-get install -y iptables ethtool curl 2>/dev/null || yum install -y iptables ethtool curl 2>/dev/null || true
@@ -190,7 +253,7 @@ mv -f /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
 
 mkdir -p /etc/hysteria
 
-# ----------------- 4. 写入服务端配置 -----------------
+# ----------------- 5. 写入服务端配置 -----------------
 echo "=== [3/5] 写入服务端配置 ==="
 cat << CONFIGEOF > /etc/hysteria/config.yaml
 listen: :443
@@ -232,7 +295,7 @@ masquerade:
 CONFIGEOF
 chmod 600 /etc/hysteria/config.yaml
 
-# ----------------- 5. 内核网络调优与端口转发规则 -----------------
+# ----------------- 6. 内核优化与端口跳跃规则 -----------------
 echo "=== [4/5] 应用网络性能调优与防火墙规则 ==="
 cat << 'SYSEOF' > /etc/sysctl.d/99-hysteria-tuned.conf
 net.core.rmem_max = 134217728
@@ -282,7 +345,14 @@ echo 'setup_rules "$PORT_HOPPING_RANGE"' >> /etc/hysteria/apply-rules.sh
 chmod +x /etc/hysteria/apply-rules.sh
 /etc/hysteria/apply-rules.sh
 
-# ----------------- 6. 注册 Systemd 并严格检验存活 -----------------
+# 缓存客户端环境参数供 hy client 读取
+cat << ENVEOF > /etc/hysteria/client_info.env
+CONNECT_HOST="$CONNECT_HOST"
+TLS_SNI="$TLS_SNI"
+PIN_SHA256="$PIN_SHA256"
+ENVEOF
+
+# ----------------- 7. Systemd 启动与存活校验 -----------------
 echo "=== [5/5] 配置守护进程并启动服务 ==="
 cat << 'SERVICEEOF' > /etc/systemd/system/hysteria-server.service
 [Unit]
@@ -309,7 +379,6 @@ systemctl daemon-reload
 systemctl enable hysteria-server
 systemctl restart hysteria-server
 
-# 进程存活检查
 sleep 2
 if ! systemctl is-active --quiet hysteria-server; then
   echo "❌ 启动失败！以下为最新 15 行错误日志："
@@ -317,16 +386,9 @@ if ! systemctl is-active --quiet hysteria-server; then
   exit 1
 fi
 
-# ----------------- 7. 生成全局管理命令 hy -----------------
+# ----------------- 8. 挂载管理命令 hy -----------------
 cat << 'HYEOF' > /usr/local/bin/hy
 #!/usr/bin/env bash
-get_domain() {
-    local d=$(grep -A 2 "^acme:" /etc/hysteria/config.yaml 2>/dev/null | grep "-" | awk '{print $2}' | tr -d ' ')
-    if [ -z "$d" ]; then
-      d=$(grep "cert:" /etc/hysteria/config.yaml 2>/dev/null | awk -F'/' '{print $5}')
-    fi
-    echo "$d"
-}
 get_pass() {
     grep -A 2 "^auth:" /etc/hysteria/config.yaml 2>/dev/null | grep "password:" | head -n 1 | awk -F'"' '{print $2}'
 }
@@ -366,11 +428,12 @@ case "$1" in
         cat /etc/hysteria/config.yaml
         ;;
     client)
-        DOMAIN=$(get_domain)
+        source /etc/hysteria/client_info.env 2>/dev/null || true
         PASS=$(get_pass)
         OBFS_PASS=$(get_obfs_pass)
         HOP_RANGE=$(get_hop_range)
 
+        # 端口跳跃解析
         MPORT_PARAM=""
         MPORT_YAML="443"
         if [ -n "$HOP_RANGE" ]; then
@@ -379,6 +442,7 @@ case "$1" in
           MPORT_YAML="443,$DASH_RANGE"
         fi
 
+        # 混淆参数解析
         OBFS_URI_PARAM=""
         OBFS_YAML_BLOCK=""
         if [ -n "$OBFS_PASS" ]; then
@@ -392,29 +456,38 @@ YAML_OBFS
 )
         fi
 
+        # 自签 Pinning / Insecure 解析
+        PIN_PARAM=""
+        PIN_YAML_LINE=""
+        if [ -n "$PIN_SHA256" ]; then
+          PIN_PARAM="&pinSHA256=$PIN_SHA256"
+          PIN_YAML_LINE="    pinSHA256: $PIN_SHA256"
+        fi
+
         echo "=== 客户端通用 URI 链接 ==="
-        echo "hysteria2://$PASS@$DOMAIN:443/?sni=$DOMAIN&insecure=0${MPORT_PARAM}${OBFS_URI_PARAM}#Hy2-Server"
+        echo "hysteria2://$PASS@$CONNECT_HOST:443/?sni=$TLS_SNI&insecure=0${PIN_PARAM}${MPORT_PARAM}${OBFS_URI_PARAM}#Hy2-Server"
         echo ""
         echo "=== 客户端 YAML 配置 (client.yaml) ==="
-        echo "server: $DOMAIN:$MPORT_YAML"
-        echo "auth: \"$PASS\""
-        if [ -n "$OBFS_YAML_BLOCK" ]; then
-          echo "$OBFS_YAML_BLOCK"
-        fi
-        echo "fastOpen: true"
-        echo "tls:"
-        echo "  sni: $DOMAIN"
-        echo "  insecure: false"
-        echo "congestion:"
-        echo "  type: bbr"
-        echo "  bbrProfile: standard"
-        echo "quic:"
-        echo "  initStreamReceiveWindow: 8388608"
-        echo "  maxStreamReceiveWindow: 8388608"
-        echo "  initConnReceiveWindow: 20971520"
-        echo "  maxConnReceiveWindow: 20971520"
-        echo "socks5:"
-        echo "  listen: 127.0.0.1:10808"
+        cat << CLI_YAML
+server: $CONNECT_HOST:$MPORT_YAML
+auth: "$PASS"
+$([ -n "$OBFS_YAML_BLOCK" ] && echo "$OBFS_YAML_BLOCK")
+fastOpen: true
+tls:
+  sni: $TLS_SNI
+  insecure: false
+$([ -n "$PIN_YAML_LINE" ] && echo "$PIN_YAML_LINE")
+congestion:
+  type: bbr
+  bbrProfile: standard
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+socks5:
+  listen: 127.0.0.1:10808
+CLI_YAML
         ;;
     *)
         echo "用法: hy {start|stop|restart|status|logs|server|client}"
