@@ -2,7 +2,7 @@
 # =========================================================
 #  Hysteria 2 一键极速安装与管理脚本 (生产增强版)
 #  - 支持 5 种 TLS 模式: Certbot、内置ACME、自签证书(Pinning)、IP证书、自定义证书
-#  - 支持 UDP 端口跳跃 (Port Hopping / mport)
+#  - 支持 UDP 端口跳跃 (Port Hopping / mport，含 INPUT 链与 NAT 联动放行)
 #  - 支持 Salamander 协议特征混淆 (Obfs)
 #  - 强制 ignoreClientBandwidth + BBR 防 QoS 调优
 # =========================================================
@@ -51,7 +51,6 @@ TLS_CONFIG_BLOCK=""
 CONNECT_HOST=""
 PIN_SHA256=""
 TLS_SNI=""
-INSECURE_FLAG="false"
 
 case "$CERT_MODE" in
   1)
@@ -97,6 +96,7 @@ CERTBOT_EOF
     read -p "请输入接收证书通知的邮箱: " ACME_EMAIL
     [ -z "$ACME_EMAIL" ] && { echo "❌ 邮箱不能为空！"; exit 1; }
 
+    # 官方标准: acme 必须为顶层配置，绝对不能嵌套在 tls 下
     TLS_CONFIG_BLOCK=$(cat << ACME_EOF
 acme:
   domains:
@@ -123,7 +123,6 @@ ACME_EOF
       -subj "/CN=$TLS_SNI" \
       -days 3650 >/dev/null 2>&1
 
-    # 计算证书公钥指纹 (Pinning)
     PIN_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_FILE" | tr -d ':' | awk -F'=' '{print $2}')
     echo "✅ 自签名证书已生成，公钥指纹: $PIN_SHA256"
 
@@ -315,27 +314,40 @@ if [ -n "$NIC" ]; then
   ethtool -K "$NIC" tx-udp-segmentation on 2>/dev/null || true
 fi
 
+# 核心：生成带 INPUT 链放行与 NAT 转发的健全防火墙规则脚本
 cat << 'RULEROOT' > /etc/hysteria/apply-rules.sh
 #!/bin/bash
 setup_rules() {
   local range="$1"
-  [ -z "$range" ] && exit 0
 
+  # 1. 显式放行 443 本身进站 (IPv4)
+  iptables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 443 -j ACCEPT
+
+  # 如果未开启端口跳跃，只放行 443 即可退出
+  [ -z "$range" ] && return 0
+
+  # 2. 显式放行跳跃端口范围进站
+  iptables -C INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$range" -j ACCEPT
+
+  # 3. 配置 NAT PREROUTING 重定向链
   iptables -t nat -D PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
   iptables -t nat -F HYSTERIA_HOPPING 2>/dev/null || true
   iptables -t nat -X HYSTERIA_HOPPING 2>/dev/null || true
 
   iptables -t nat -N HYSTERIA_HOPPING
   iptables -t nat -A HYSTERIA_HOPPING -p udp --dport "$range" -j REDIRECT --to-ports 443
-  iptables -t nat -A PREROUTING -j HYSTERIA_HOPPING
+  iptables -t nat -I PREROUTING -j HYSTERIA_HOPPING
 
+  # 4. 同步处理 IPv6 环境 (若内核支持)
   if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport 443 -j ACCEPT 2>/dev/null || true
+    ip6tables -C INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$range" -j ACCEPT 2>/dev/null || true
     ip6tables -t nat -D PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
     ip6tables -t nat -F HYSTERIA_HOPPING 2>/dev/null || true
     ip6tables -t nat -X HYSTERIA_HOPPING 2>/dev/null || true
     ip6tables -t nat -N HYSTERIA_HOPPING 2>/dev/null || true
     ip6tables -t nat -A HYSTERIA_HOPPING -p udp --dport "$range" -j REDIRECT --to-ports 443 2>/dev/null || true
-    ip6tables -t nat -A PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
+    ip6tables -t nat -I PREROUTING -j HYSTERIA_HOPPING 2>/dev/null || true
   fi
 }
 RULEROOT
@@ -345,7 +357,7 @@ echo 'setup_rules "$PORT_HOPPING_RANGE"' >> /etc/hysteria/apply-rules.sh
 chmod +x /etc/hysteria/apply-rules.sh
 /etc/hysteria/apply-rules.sh
 
-# 缓存客户端环境参数供 hy client 读取
+# 缓存连接端信息供客户端读取
 cat << ENVEOF > /etc/hysteria/client_info.env
 CONNECT_HOST="$CONNECT_HOST"
 TLS_SNI="$TLS_SNI"
@@ -379,6 +391,7 @@ systemctl daemon-reload
 systemctl enable hysteria-server
 systemctl restart hysteria-server
 
+# 严格存活熔断检测
 sleep 2
 if ! systemctl is-active --quiet hysteria-server; then
   echo "❌ 启动失败！以下为最新 15 行错误日志："
@@ -442,7 +455,7 @@ case "$1" in
           MPORT_YAML="443,$DASH_RANGE"
         fi
 
-        # 混淆参数解析
+        # 混淆解析
         OBFS_URI_PARAM=""
         OBFS_YAML_BLOCK=""
         if [ -n "$OBFS_PASS" ]; then
